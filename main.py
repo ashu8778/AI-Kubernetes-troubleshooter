@@ -1,18 +1,21 @@
 """AI Kubernetes Troubleshooter CLI
 
-Usage: python main.py [--model MODEL] [--kubeconfig PATH] [--no-model]
+Usage: python main.py [--model MODEL] [--openrouter-model MODEL] [--kubeconfig PATH] [--no-model]
 
-The tool inspects a local kubeconfig-connected cluster and asks a
-locally-hosted LLM model (via the `ollama` python package or CLI)
-to analyze findings and suggest fixes.
+The tool inspects a local kubeconfig-connected cluster, then:
+  1. Uses a locally-hosted Ollama model to remove personal/sensitive
+     information from the collected findings (sanitization).
+  2. Sends the sanitized findings to an OpenRouter-hosted model (using
+     the OPENROUTER_API_KEY environment variable) to analyze root causes
+     and suggest remediation steps.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
-import sys
 import textwrap
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -173,7 +176,8 @@ def _extract_ollama_text(resp) -> str:
 	return str(resp)
 
 
-def run_model_prompt(prompt: str, model: str = "gemma3:1b") -> str:
+def run_ollama_prompt(prompt: str, model: str = "gemma3:1b") -> str:
+	"""Run a prompt against a local Ollama model (python package or CLI)."""
 	# Prefer python package if available
 	try:
 		import ollama
@@ -206,11 +210,89 @@ def run_model_prompt(prompt: str, model: str = "gemma3:1b") -> str:
 		return "Ollama not available (python package or CLI). Install ollama or the ollama python package."
 
 
+def sanitize_with_ollama(report: str, model: str = "gemma3:1b") -> str:
+	"""Use the local Ollama model to strip personal/sensitive information.
+
+	The report can contain node hostnames, pod names, namespaces, usernames,
+	IP addresses, and other personally identifiable information (PII).
+	This step replaces them with generic placeholders while preserving the
+	technical troubleshooting details.
+	"""
+	prompt = textwrap.dedent(f"""
+	You are a local data-sanitization assistant. The text below contains
+	Kubernetes cluster findings that may include personal or sensitive
+	information such as node hostnames, pod names, namespaces, usernames,
+	IP addresses, cloud resource names, service accounts, and other
+	personally identifiable information (PII).
+
+	Rewrite the report and replace ALL personal and sensitive identifiers
+	with generic placeholders such as "[node-1]", "[namespace-1]",
+	"[ip-1]", "[user-1]", "[secret-1]".
+
+	Keep every technical detail relevant to troubleshooting — error messages,
+	reasons, phases, conditions, restart counts, capacities, and timestamps.
+	Do not add commentary. Return only the sanitized report.
+	If you cannot process the text, return it unchanged.
+
+	--- REPORT START ---
+	{report}
+	--- REPORT END ---
+	""")
+	return run_ollama_prompt(prompt, model=model)
+
+
+def run_openrouter_prompt(prompt: str, model: str, api_key: str) -> str:
+	"""Run a prompt against an OpenRouter-hosted model."""
+	try:
+		import requests
+	except ImportError:
+		return "OpenRouter request failed: 'requests' package not installed. Run: pip install requests"
+
+	url = "https://openrouter.ai/api/v1/chat/completions"
+	headers = {
+		"Authorization": f"Bearer {api_key}",
+		"Content-Type": "application/json",
+	}
+	payload = {
+		"model": model,
+		"messages": [{"role": "user", "content": prompt}],
+		"reasoning": {"enabled": True}
+	}
+
+	try:
+		resp = requests.post(url, headers=headers, json=payload, timeout=120)
+		resp.raise_for_status()
+		data = resp.json()
+	except requests.exceptions.RequestException as e:
+		return f"OpenRouter request failed: {e}"
+
+	choices = data.get("choices") or []
+	if not choices:
+		return "OpenRouter returned no choices."
+	msg = choices[0].get("message") or {}
+	content = msg.get("content")
+	if not content:
+		return "OpenRouter returned an empty response."
+	return content.strip()
+
+
+def build_troubleshooting_prompt(sanitized_report: str) -> str:
+	return textwrap.dedent(f"""
+	You are a Kubernetes troubleshooting assistant. Here are findings from a cluster:
+
+	{sanitized_report}
+
+	Provide a concise analysis of likely root causes and step-by-step remediation suggestions.
+	Keep output short and actionable.
+	""")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
 	parser = argparse.ArgumentParser(description="AI Kubernetes Troubleshooter CLI")
-	parser.add_argument("--model", default="gemma3:1b", help="Local model name (default: gemma3:1b)")
+	parser.add_argument("--model", default="gemma3:1b", help="Local Ollama model used to sanitize personal information (default: gemma3:1b)")
+	parser.add_argument("--openrouter-model", default="nvidia/nemotron-3-ultra-550b-a55b:free", help="OpenRouter model used for troubleshooting (default: openrouter/auto)")
 	parser.add_argument("--kubeconfig", default=None, help="Path to kubeconfig")
-	parser.add_argument("--no-model", action="store_true", help="Do not call the local model; only print findings")
+	parser.add_argument("--no-model", action="store_true", help="Do not call any model; only print findings")
 	args = parser.parse_args(argv)
 
 	try:
@@ -228,26 +310,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 		return 2
 
 	report = summarize_findings(nodes, pods, events)
-	print("\n== Cluster Findings ==\n")
-	print(report)
 
 	if args.no_model:
+		print("\n=== Cluster Findings ===\n")
+		print(report)
 		return 0
 
-	prompt = textwrap.dedent(f"""
-	You are a Kubernetes troubleshooting assistant. Here are findings from a cluster:
+	# Step 1: Remove personal information using the local Ollama model.
+	print("\n=== Report Before Sanitization ===\n")
+	print(report)
 
-	{report}
-
-	Provide a concise analysis of likely root causes and step-by-step remediation suggestions.
-	Keep output short and actionable.
-	""")
-
-	print("\n== Model Analysis (local model) ==\n")
-	resp = run_model_prompt(prompt, model=args.model)
-	print(resp)
-	if resp.startswith("Ollama not available"):
+	print("\n=== Sanitizing report (local Ollama) ===\n")
+	sanitized = sanitize_with_ollama(report, model=args.model)
+	if sanitized.startswith("Ollama not available"):
+		print(sanitized)
 		return 3
+
+	print("\n=== Report After Sanitization ===\n")
+	print(sanitized)
+
+	# Step 2: Troubleshoot using an OpenRouter-hosted model.
+	api_key = os.environ.get("OPENROUTER_API_KEY")
+	if not api_key:
+		print("\nNo OpenRouter API key found. Set the OPENROUTER_API_KEY environment variable.")
+		return 4
+
+	prompt = build_troubleshooting_prompt(sanitized)
+
+	print("\n=== Model Analysis (OpenRouter) ===\n")
+	resp = run_openrouter_prompt(prompt, model=args.openrouter_model, api_key=api_key)
+	print(resp)
+	if resp.startswith("OpenRouter request failed"):
+		return 5
 	return 0
 
 
